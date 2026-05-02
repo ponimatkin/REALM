@@ -1,21 +1,24 @@
-import numpy as np
-import torch
 from queue import Queue
 import datetime
+import time
 import os
 import random
-import glob
 import csv
+import numpy as np
+import torch
+from scipy.spatial.transform import Rotation as Rot
+
 import omnigibson as og
 from omnigibson.macros import gm
-from realm.environments.realm_environment_dynamic import RealmEnvironmentDynamic
+
+from realm.environments.env_dynamic import RealmEnvironmentDynamic
 from realm.inference import InferenceClient, extract_from_obs
-from realm.logging import VideoRecorder, save_results_to_csv
-import time
+from realm.realm_logging import VideoRecorder, save_results, append_trajectory, append_video
+
 
 
 SUPPORTED_TASKS = [
-    "put_green_block_in_bowl", #0
+    "put_green_block_into_bowl", #0
     "put_banana_into_box", #1
     "rotate_marker", #2
     "rotate_mug", #3
@@ -30,8 +33,8 @@ SUPPORTED_TASKS = [
 SUPPORTED_PERTURBATIONS = [
     'Default', #0
     'V-AUG', # 1
-    'V-VIEW', # 2
-    'V-SC', # 3
+    'V-VIEW',  # 2
+    'V-SC', # 1
     'V-LIGHT', # 4
     'S-PROP', # 5
     'S-LANG', # 6
@@ -41,18 +44,28 @@ SUPPORTED_PERTURBATIONS = [
     'B-HOBJ', # 10
     'SB-NOUN', # 11
     'SB-VRB', # 12
-    'VB-POSE', # 13
-    'VB-MOBJ', # 14
+    'VB-POSE',  # 13
+    'VB-MOBJ',  # 14
     'VSB-NOBJ' # 15
 ]
 
 
-def set_sim_config():
-    gm.DEFAULT_SIM_STEP_FREQ = 15
-    gm.DEFAULT_RENDERING_FREQ = 15
+def set_sim_config(rendering_mode=None, robot="DROID"):
+    if robot == "WidowX": # TODO: just read this from the yamls...
+        gm.DEFAULT_SIM_STEP_FREQ = 5
+        gm.DEFAULT_RENDERING_FREQ = 5
+    elif "UR5" in robot:
+        gm.DEFAULT_SIM_STEP_FREQ = 30
+        gm.DEFAULT_RENDERING_FREQ = 30
+    else:
+        gm.DEFAULT_SIM_STEP_FREQ = 15
+        gm.DEFAULT_RENDERING_FREQ = 15
+
     gm.DEFAULT_PHYSICS_FREQ = 120
     gm.ENABLE_TRANSITION_RULES = False # this needs to be off to avoid bug with sludge state during collision: https://github.com/StanfordVL/BEHAVIOR-1K/issues/1201
     gm.ENABLE_OBJECT_STATES = True # this needs to be on because push_switch task usees the ToggledOn state
+    gm.RENDER_VIEWER_CAMERA=False
+    gm.ENABLE_HQ_RENDERING = False if rendering_mode == "r" else True
 
     seed = 1234
     random.seed(seed)
@@ -69,50 +82,69 @@ def evaluate(
         repeats=1,
         max_steps=500,
         horizon=8,
-        model="pi0_FAST",
+        model_type="pi0_FAST",
         port=8000,
+        host="127.0.0.1",
         log_dir="/app/logs",
-        resume_run_id=None
+        resume=False,
+        multi_view=False,
+        no_record=False,
+        no_render=False,
+        rendering_mode=None,
+        task_cfg_path=None,
+        robot="DROID"
 ):
     start = time.perf_counter()
     og.log.info(f"DEBUG: Begin eval: {time.perf_counter() - start:.4f}s")
-    set_sim_config()
+    if rendering_mode is None:
+        rendering_mode = "rt"
+    set_sim_config(rendering_mode=rendering_mode, robot=robot)
 
     # -------------------- Create the environment + client --------------------
-    task = SUPPORTED_TASKS[task_id]
+    if task_cfg_path is None:
+        task = SUPPORTED_TASKS[task_id]
+        task_cfg_path = f"REALM_DROID10/{task}/default.yaml"
+    else:
+        task = task_cfg_path.split("/")[-2]
+        config_name = task_cfg_path.split("/")[-1].replace(".yaml", "").replace(".cfg", "")
+        if config_name != "default":
+            task = f"{task}_{config_name}"
+
     perturbations = [SUPPORTED_PERTURBATIONS[perturbation_id]]
 
     os.makedirs(log_dir, exist_ok=True)
 
-    model_type = model # TODO: infer type from model name, rn this will just default to a pi model inference inside the client
-    client = InferenceClient(model_type, port)
+    model_type = model_type # TODO: infer type from model name, rn this will just default to a pi model inference inside the client
+    client = InferenceClient(model_type, host=host, port=port)
     og.log.info(f"DEBUG: Client connected: {time.perf_counter() - start:.4f}s")
 
     env = RealmEnvironmentDynamic(
         config_path="/app/realm/config",
-        task=task,
-        perturbations=perturbations
+        task_cfg_path=task_cfg_path,
+        perturbations=perturbations,
+        multi_view=multi_view,
+        no_rendering=no_render,
+        rendering_mode=rendering_mode,
+        robot=robot
     )
     og.log.info(f"DEBUG: Env created: {time.perf_counter() - start:.4f}s")
 
-    if resume_run_id:
-        # find matching file
-        search_pattern = os.path.join(log_dir, "reports", f"{resume_run_id}*report.csv")
-        matches = glob.glob(search_pattern)
-        if not matches:
-            raise ValueError(f"Could not find run report to resume with ID {resume_run_id}")
-        csv_filename = matches[0]
-        # read existing results
-        with open(csv_filename, 'r') as f:
-            reader = csv.DictReader(f)
-            existing_results = list(reader)
-        results = existing_results
-        start_repeat = len(results)
-        og.log.info(f"Resuming run {resume_run_id} from repeat {start_repeat}. Using file: {csv_filename}")
-    else:
-        results = []
-        start_repeat = 0
-        csv_filename = None
+    results = []
+    start_repeat = 0
+    results_filename = None
+
+    if resume:
+        potential_csv = os.path.join(log_dir, "reports", f"{task}_{perturbations[0]}.csv")
+        if os.path.exists(potential_csv):
+            results_filename = potential_csv
+            with open(results_filename, 'r') as f:
+                reader = csv.DictReader(f)
+                existing_results = list(reader)
+            results = existing_results
+            start_repeat = len(results)
+            og.log.info(f"Resuming run from repeat {start_repeat}. Using file: {results_filename}")
+        else:
+            og.log.info(f"Resume requested but no report found. Starting fresh.")
 
     for run_id in range(repeats):
         # ------------------------ pre-configure each run --------------------------------
@@ -126,17 +158,14 @@ def evaluate(
             continue
 
         timestamp = datetime.datetime.now().strftime("%Y_%m_%d_%H:%M:%S")
-
-        video_recorder = VideoRecorder(log_dir, timestamp, run_id)
+        video_recorder = VideoRecorder(log_dir, timestamp, run_id, task, perturbations[0])
 
         qpos = []
         actions = []
         action_buffer = Queue()
 
-        obs, _ = env.reset()
-        instruction = env.instruction
-
         # -------------------- Rollout loop --------------------
+        obs, _ = env.reset()
         obs, rew, terminated, truncated, info = env.warmup(obs)
 
         t = 0
@@ -153,7 +182,7 @@ def evaluate(
         was_grasping = False
 
         while t < max_steps and terminal_steps > 0:
-            base_im, base_im_second, wrist_im, robot_state, gripper_state = extract_from_obs(obs)
+            base_im, base_depth, base_im_second, base_depth_second, wrist_im, robot_state, gripper_state = extract_from_obs(obs, robot_name=env.robot.name)
 
             # Metrics collection
             ee_pos, ee_rot = env.get_ee_pose()
@@ -184,31 +213,49 @@ def evaluate(
             was_grasping = is_grasping
 
             if action_buffer.empty():
+                # Compute robot-relative cartesian position for models that need it (e.g. DreamZero)
+                _ee_pos = ee_pos.cpu().numpy() if hasattr(ee_pos, 'cpu') else np.array(ee_pos)
+                _ee_rot = ee_rot.cpu().numpy() if hasattr(ee_rot, 'cpu') else np.array(ee_rot)
+                _ee_euler = Rot.from_quat(_ee_rot).as_euler('xyz')
+                _ee_pose_world = np.concatenate([_ee_pos, _ee_euler])
+                cartesian_position = env._world2robot(_ee_pose_world).astype(np.float32)
+
                 pred_action_chunk = client.infer(
-                    instruction, base_im, base_im_second, wrist_im, robot_state, gripper_state,
-                    use_base_im_second=(env.task_type == "open_close_drawer" if hasattr(env, "task_type") else False)
+                    env.instruction, base_im, base_im_second, wrist_im, robot_state, gripper_state,
+                    use_base_im_second=(env.task_type == "open_close_drawer" if hasattr(env, "task_type") else False),
+                    ee_control=env.ee_control,
+                    cartesian_position=cartesian_position
                 )
 
                 if len(pred_action_chunk.shape) == 2:
-                    assert pred_action_chunk.shape[-1] == 8
                     for action in pred_action_chunk[:horizon]:
                         action = np.squeeze(action)
                         action_buffer.put(action)
-                else:
+                elif len(pred_action_chunk.shape) < 2:
                     action_buffer.put(pred_action_chunk)
+                else:
+                    assert len(pred_action_chunk.shape) <= 2, f"Unsupported number of dimensions in action chunk with shape: {pred_action_chunk.shape}. The chunk is expected to be 2D."
 
-            video_recorder.add_frame(base_im, wrist_im)
+            if not no_record:
+                video_recorder.add_frame(base_im, wrist_im, base_im_second)
 
             qpos.append(np.concatenate((robot_state, np.atleast_1d(np.array(gripper_state)))))
 
             action = action_buffer.get()
             actions.append(action)
 
-            new_joint_action = action.copy()[:7]
+            new_action = action.copy()
+            if model_type in ["debug", "openpi", "GR00T", "GR00T_N16", "dreamzero"]: # TODO: use a model config
+                new_action[-1] = 1 if action[-1] > 0.5 else -1  # Prediction: (1,0) -> Target: (1,-1)
+            elif model_type == "molmoact":
+                new_action[-1] = 1 if action[-1] < 0.5 else -1  # Prediction: (0,1) -> Target: (1,-1)
+            else:
+                raise NotImplementedError()
 
-            new_gripper_state = 1 if action[7] > 0.5 else -1  # Prediction: (1,0) -> Target: (1,-1)
-            new_gripper_state = np.atleast_1d(np.array(new_gripper_state))
-            new_action = np.concatenate((new_joint_action, new_gripper_state))
+
+            # new_gripper_state = 1 if action[-1] > 0.5 else -1  # Prediction: (1,0) -> Target: (1,-1)
+            # new_gripper_state = np.atleast_1d(np.array(new_gripper_state))
+            # new_action = np.concatenate((new_action, new_gripper_state))
 
             obs, curr_task_progression, terminated, truncated, info = env.step(new_action)
 
@@ -269,12 +316,12 @@ def evaluate(
         if task_progression == 1.0 and hasattr(env, "task_type") and env.task_type in ["put", "stack"]:
             drops = max(0, drops - 1)
 
-        results.append({
+        result_entry = {
             "run_id": run_id,
             "task": task,
             "perturbation": perturbations[0],
-            "instruction": instruction,
-            "model": model,
+            "instruction": env.instruction,
+            "model": model_type,
             "real2sim": "Simulated",
             "env": "REALM",
             "task_progression": task_progression,
@@ -290,23 +337,30 @@ def evaluate(
             "collisions_self": collisions_self,
             "collisions_env": collisions_env,
             "object_drops": drops
-        })
+        }
 
-        video_filename = os.path.join(log_dir, "videos", f"{task}_{perturbations[0]}_{run_id}")
-        video_recorder.save_video(video_filename)
-        video_recorder.cleanup()
+        result_entry["qpos"] = np.stack(qpos).tolist()
+        result_entry["actions"] = np.stack(actions).tolist()
+        if not no_record:
+            video_bytes = video_recorder.get_video_bytes()
+            result_entry["video"] = video_bytes
+        
+        results.append(result_entry)
 
-        qpos_filename = os.path.join(log_dir, "qpos", f"{task}_{perturbations[0]}_{run_id}")
-        os.makedirs(log_dir + "/qpos", exist_ok=True)
-        np.save(qpos_filename, np.stack(qpos))
+        if not no_record:
+            append_video(log_dir, task, perturbations[0], run_id, video_bytes)
 
-        actions_filename = os.path.join(log_dir, "actions", f"{task}_{perturbations[0]}_{run_id}")
-        os.makedirs(log_dir + "/actions", exist_ok=True)
-        np.save(actions_filename, np.stack(actions))
+        append_trajectory(log_dir, task, perturbations[0], run_id, np.stack(qpos), np.stack(actions))
 
-        csv_filename = save_results_to_csv(results, log_dir + "/reports", task, perturbations[0], filename=csv_filename)
+        if not no_record:
+            video_recorder.cleanup()
+
+        client.reset()
+
+        results_filename = save_results(results, log_dir + "/reports", task, perturbations[0], filename=results_filename)
 
     # ------------------------------------------------------------------------------
-    save_results_to_csv(results, log_dir+"/reports", task, perturbations[0])
+    save_results(results, log_dir+"/reports", task, perturbations[0])
     og.log.info("Done!")
     og.log.info(f"DEBUG: Done: {time.perf_counter() - start:.4f}s")
+

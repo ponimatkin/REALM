@@ -52,13 +52,21 @@ class DroidEndEffectorController(LocomotionController, ManipulationController, G
             use_delta_commands=False,  # Delta commands are less common for torque control
             compute_delta_in_quat_space=None,  # Delta commands are less common for torque control
             mode="pose_delta_ori",
-            workspace_pose_limiter=None
+            workspace_pose_limiter=None,
+            max_effort=None,
+            min_effort=None,
+            height_offset=0.87
     ):
         self._motor_type = motor_type.lower()
         self._use_impedances = True
 
+        self.max_effort = None if max_effort is None else th.tensor(max_effort).to(og.sim.device)
+        self.min_effort = None if min_effort is None else th.tensor(min_effort).to(og.sim.device)
+
         self._use_gravity_compensation = use_gravity_compensation
         self._use_cc_compensation = use_cc_compensation
+
+        self.height_offset = height_offset
 
         assert mode in IK_MODES, f"Invalid ik mode specified! Valid options are: {IK_MODES}, got: {mode}"
 
@@ -70,7 +78,6 @@ class DroidEndEffectorController(LocomotionController, ManipulationController, G
         self.workspace_pose_limiter = workspace_pose_limiter
         self.task_name = f"eef_0"
         self.mode = mode
-        self.gt_traj = np.load(f"/app/data/droid_1.0.1/episode_000000_action.joint_position.npy", allow_pickle=True)
 
         super().__init__(
             control_freq=control_freq,
@@ -109,7 +116,7 @@ class DroidEndEffectorController(LocomotionController, ManipulationController, G
         # Convert position command to absolute values if needed
         if self.mode == "absolute_pose":
             target_pos = command[:3]
-            target_pos[2] += 0.87 # height of robot base
+            target_pos[-1] += self.height_offset
         else:
             dpos = command[:3]
             target_pos = pos_relative + dpos
@@ -129,6 +136,11 @@ class DroidEndEffectorController(LocomotionController, ManipulationController, G
             # Target quat is simply the current robot orientation
             target_quat = quat_relative
         elif self.mode == "pose_absolute_ori" or self.mode == "absolute_pose":
+            if command.shape[-1] < 6:
+                raise ValueError(
+                    f"Command for mode {self.mode} has fewer than 6 dimensions ({command.shape[-1]}). "
+                    "Expected 6 dimensions (x,y,z,ax,ay,az) but RPY components are missing."
+                )
             # Received "delta" ori is in fact the desired absolute orientation
             target_quat = T.euler2quat(command[3:6])
             target_rpy = command[3:6]
@@ -155,13 +167,10 @@ class DroidEndEffectorController(LocomotionController, ManipulationController, G
             target_cartesian_pos_vel=target_cartesian_pos_vel,
             target_cartesian_rot_vel=target_cartesian_rot_vel,
         )
-
         return goal_dict
 
     def compute_control(self, goal_dict, control_dict):
         self.time_tracker += 1
-        # if self.time_tracker % gm.DEFAULT_SIM_STEP_FREQ != 0:
-        #     return self.cached_torque
         current_joint_pos = control_dict["joint_position"][self.dof_idx].to(og.sim.device)
         current_joint_vel = control_dict["joint_velocity"][self.dof_idx].to(og.sim.device)
 
@@ -174,6 +183,7 @@ class DroidEndEffectorController(LocomotionController, ManipulationController, G
 
         #--------------------------------------------------------------------------------
         pos_current = control_dict[f"{self.task_name}_pos_relative"]
+
         quat_current = control_dict[f"{self.task_name}_quat_relative"]
         rpy_current = th.from_numpy(R.from_quat(quat_current.numpy()).as_euler('xyz'))
 
@@ -182,31 +192,13 @@ class DroidEndEffectorController(LocomotionController, ManipulationController, G
         if self.mode not in ["cartesian_velocity"] and th.allclose(pos_current, goal_dict["target_pos"], atol=1e-4) and th.allclose(quat_current, goal_dict["target_quat"], atol=1e-4):
             joint_pos_desired = current_joint_pos
         else:
-            # Compute the pose error. Note that this is computed NOT in the EEF frame but still
-            # in the base frame.
-            # pos_err = goal_dict["target_pos"] - pos_current
-            # ori_err = orientation_error(T.quat2mat(goal_dict["target_quat"]), T.quat2mat(quat_current))
-            # err = th.cat([pos_err, ori_err])
-            #
-            # # Use the jacobian to compute a local approximation
-            # j_eef = jacobian
-            # j_eef_pinv = th.linalg.pinv(j_eef)
-            # delta_j = j_eef_pinv @ err
-            #
-            # target_joint_pos = current_joint_pos + delta_j
-            #
-            # # Clip values to be within the joint limits
-            # joint_pos_desired = target_joint_pos.clamp(
-            #     min=self._control_limits[ControlType.get_type("position")][0][self.dof_idx],
-            #     max=self._control_limits[ControlType.get_type("position")][1][self.dof_idx],
-            # )
-
             action_dict = {}
             if self.mode == "cartesian_velocity":
                 action_dict["cartesian_velocity"] = th.cat([goal_dict["target_cartesian_pos_vel"], goal_dict["target_cartesian_rot_vel"]])
                 action_dict["cartesian_delta"] = self._ik_solver.cartesian_velocity_to_delta(action_dict["cartesian_velocity"])
             elif self.mode == "pose_delta_ori":
-                action_dict["cartesian_delta"] = th.cat([goal_dict["target_pos_relative"], goal_dict["target_rpy_relative"]])
+                dpos = goal_dict["target_pos"] - goal_dict["target_pos_relative"]
+                action_dict["cartesian_delta"] = th.cat([dpos, goal_dict["target_rpy_relative"]])
                 cartesian_velocity = self._ik_solver.cartesian_delta_to_velocity(action_dict["cartesian_delta"])
                 action_dict["cartesian_velocity"] = cartesian_velocity.tolist()
             elif self.mode == "absolute_pose":
@@ -229,8 +221,7 @@ class DroidEndEffectorController(LocomotionController, ManipulationController, G
             joint_pos_desired = th.tensor(action_dict["joint_position"], dtype=th.float32, device=og.sim.device)
 
         #--------------------------------------------------------------------------------
-        #joint_pos_desired = th.from_numpy(self.gt_traj[min(floor(self.time_tracker / 8), len(self.gt_traj) - 1)])
-        joint_vel_desired = th.zeros(7).to(og.sim.device)  # TODO: maybe this also needs to have gripper
+        joint_vel_desired = th.zeros(7).to(og.sim.device)
 
         Kp = jacobian.T @ self.Kx @ jacobian + self.Kq
         Kd = jacobian.T @ self.Kxd @ jacobian + self.Kqd
@@ -247,6 +238,10 @@ class DroidEndEffectorController(LocomotionController, ManipulationController, G
         if self._use_cc_compensation:
             u += control_dict["cc_force"][self.dof_idx].to(og.sim.device)
 
+        if self.min_effort is not None and self.max_effort is not None:
+            assert u.shape == self.max_effort.shape == self.min_effort.shape
+            u = u.clip(self.min_effort, self.max_effort)
+
         return u
 
     def clip_control(self, control):
@@ -262,9 +257,19 @@ class DroidEndEffectorController(LocomotionController, ManipulationController, G
         return control_copy
 
     def compute_no_op_goal(self, control_dict):
+        pos_relative = control_dict[f"{self.task_name}_pos_relative"]
+        quat_relative = control_dict[f"{self.task_name}_quat_relative"]
+        rpy_relative = th.from_numpy(R.from_quat(quat_relative.cpu().numpy()).as_euler('xyz')).to(pos_relative.device)
+
         return dict(
-            target_pos=control_dict[f"{self.task_name}_pos_relative"],
-            target_quat=control_dict[f"{self.task_name}_quat_relative"],
+            target_pos=pos_relative,
+            target_quat=quat_relative,
+            target_rpy=rpy_relative,
+            target_pos_relative=th.zeros(3, dtype=th.float32, device=pos_relative.device),
+            target_quat_relative=quat_relative,
+            target_rpy_relative=th.zeros(3, dtype=th.float32, device=pos_relative.device),
+            target_cartesian_pos_vel=th.zeros(3, dtype=th.float32, device=pos_relative.device),
+            target_cartesian_rot_vel=th.zeros(3, dtype=th.float32, device=pos_relative.device),
         )
 
     def _compute_no_op_action(self, control_dict):
@@ -293,6 +298,12 @@ class DroidEndEffectorController(LocomotionController, ManipulationController, G
         return dict(
             target_pos=(3,),
             target_quat=(4,),
+            target_rpy=(3,),
+            target_pos_relative=(3,),
+            target_quat_relative=(4,),
+            target_rpy_relative=(3,),
+            target_cartesian_pos_vel=(3,),
+            target_cartesian_rot_vel=(3,),
         )
 
     def _to_tensor(self, input):

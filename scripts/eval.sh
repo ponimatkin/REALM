@@ -56,6 +56,8 @@ Rest of options:
 
   -e, --environment ENV      Evaluation environment: singularity | docker | current
                              Default: singularity
+  
+  --multi-view               Enable multi-view camera (adds a second external camera)
 
 Other:
   -h, --help                 Show this help and exit
@@ -84,12 +86,49 @@ MAX_STEPS=500
 MODEL="pi0"
 CKPT_PATH=""             # required
 EVAL_ENV="singularity"
+MULTI_VIEW=false
+NO_RENDER=false
+ROBOT=""
+TASK_CFG_PATH=""
+RENDERING_MODE="rt"
 
 # --------------------------------------------------------------------------------------
 # Parse flag arguments
 # --------------------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --multi-view)
+            MULTI_VIEW=true
+            shift
+            ;;
+        --no-render)
+            NO_RENDER=true
+            shift
+            ;;
+        --robot)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --robot requires a value" >&2
+                exit 1
+            fi
+            ROBOT="$2"
+            shift 2
+            ;;
+        --task-cfg-path)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --task-cfg-path requires a value" >&2
+                exit 1
+            fi
+            TASK_CFG_PATH="$2"
+            shift 2
+            ;;
+        --rendering-mode)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --rendering-mode requires a value" >&2
+                exit 1
+            fi
+            RENDERING_MODE="$2"
+            shift 2
+            ;;
         -p|--perturbation-id)
             if [[ $# -lt 2 ]]; then
                 echo "Error: --perturbation-id requires a value" >&2
@@ -589,6 +628,33 @@ mkdir -p "$REALM_ROOT/.cache/pip"
 # TODO: evaluation part should not depend on model or ckpt_path
 # If you want to use it only for naming then just a prefix should be passed
 
+MULTI_VIEW_FLAG=""
+if [ "$MULTI_VIEW" = true ]; then
+    MULTI_VIEW_FLAG="--multi-view true"
+else
+    MULTI_VIEW_FLAG="--multi-view false"
+fi
+
+NO_RENDER_FLAG=""
+if [ "$NO_RENDER" = true ]; then
+    NO_RENDER_FLAG="--no_render"
+fi
+
+ROBOT_FLAG=""
+if [ -n "$ROBOT" ]; then
+    ROBOT_FLAG="--robot $ROBOT"
+fi
+
+TASK_CFG_ARG=""
+if [ -n "$TASK_CFG_PATH" ]; then
+    TASK_CFG_ARG="--task_cfg_path $TASK_CFG_PATH"
+fi
+
+RENDERING_MODE_FLAG=""
+if [ -n "$RENDERING_MODE" ]; then
+    RENDERING_MODE_FLAG="--rendering_mode $RENDERING_MODE"
+fi
+
 case "$EVAL_ENV" in
     singularity)
         if [[ -z "${REALM_SIF:-}" ]]; then
@@ -620,13 +686,18 @@ case "$EVAL_ENV" in
             --env "MAMBA_CACHE_DIR=/app/.cache/mamba/${SERVER_PID}" \
             --env "PIP_CACHE_DIR=/app/.cache/pip/${SERVER_PID}" \
             "$REALM_SIF" \
-            micromamba run -n omnigibson python -u examples/02_eval_dynamic_scenes.py \
+            micromamba run -n omnigibson python -u realm/eval.py \
                 --perturbation_id $PERTURBATION_ID \
                 --task_id $TASK_ID \
                 --repeats $REPEATS \
                 --max_steps $MAX_STEPS \
                 --model $MODEL \
-                --port $PORT
+                --port $PORT \
+                $MULTI_VIEW_FLAG \
+                $NO_RENDER_FLAG \
+                $ROBOT_FLAG \
+                $TASK_CFG_ARG \
+                $RENDERING_MODE_FLAG
         ;;
     docker)
         docker run \
@@ -646,22 +717,32 @@ case "$EVAL_ENV" in
             -v "$REALM_DATA_PATH/isaac-sim/data:/root/.local/share/ov/data:rw" \
             -v "$REALM_DATA_PATH/isaac-sim/documents:/root/Documents:rw" \
             --network=host --rm stanfordvl/omnigibson:1.1.1 \
-            micromamba run -n omnigibson python -u examples/02_eval_dynamic_scenes.py \
+            micromamba run -n omnigibson python -u realm/eval.py \
                 --perturbation_id $PERTURBATION_ID \
                 --task_id $TASK_ID \
                 --repeats $REPEATS \
                 --max_steps $MAX_STEPS \
                 --model $MODEL \
-                --port $PORT
+                --port $PORT \
+                $MULTI_VIEW_FLAG \
+                $NO_RENDER_FLAG \
+                $ROBOT_FLAG \
+                $TASK_CFG_ARG \
+                $RENDERING_MODE_FLAG
         ;;
     current)
-        micromamba run -n omnigibson python -u examples/02_eval_dynamic_scenes.py \
+        micromamba run -n omnigibson python -u realm/eval.py \
             --perturbation_id $PERTURBATION_ID \
             --task_id $TASK_ID \
             --repeats $REPEATS \
             --max_steps $MAX_STEPS \
             --model $MODEL \
-            --port $PORT
+            --port $PORT \
+            $MULTI_VIEW_FLAG \
+            $NO_RENDER_FLAG \
+            $ROBOT_FLAG \
+            $TASK_CFG_ARG \
+            $RENDERING_MODE_FLAG
         ;;
 esac
 
